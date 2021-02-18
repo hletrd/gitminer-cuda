@@ -20,11 +20,11 @@ using namespace std;
 #define range_upper 'z' //inclusive
 
 //nonce range (sequence in base.txt)
-#define data_range_start 226
+#define data_range_start 237
 #define data_range_end 246
 
 //variable part of nonce
-#define data_range_len_var 10
+#define data_range_len_var 6
 
 #define data_len_max 320 //expected max length of input data
 
