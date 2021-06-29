@@ -238,8 +238,8 @@ void output(uint8_t *data, uint32_t data_len) {
 
 int main(int argc, char *argv[]) {
 	uint8_t *DATA;
-	uint32_t RESULT_LEAST[5] = {0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff};
-	uint8_t *DATA_LEAST;
+	uint32_t RESULT_LOWEST[5] = {0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff};
+	uint8_t *DATA_LOWEST;
 	uint32_t DATA_LEN, PADDED_LEN;
 
 	char buf[1000], buf_nonce[1000];
@@ -266,7 +266,7 @@ int main(int argc, char *argv[]) {
 	}
 	
 	DATA = (uint8_t*) calloc(DATA_LEN, sizeof(uint8_t));
-	DATA_LEAST = (uint8_t*) calloc(DATA_LEN, sizeof(uint8_t));
+	DATA_LOWEST = (uint8_t*) calloc(DATA_LEN, sizeof(uint8_t));
 
 	file_base.seekg(0, ios::beg);
 	file_base.read((char*)DATA, DATA_LEN);
@@ -299,26 +299,26 @@ int main(int argc, char *argv[]) {
 	log("Allocating memory...");
 
 	uint32_t NONCE_LEN = data_range_end - data_range_start;
-	uint8_t *NONCE_TEMP, *NONCE_THREAD, *NONCE_THREAD_LEAST, *BASE;
-	uint32_t *RESULT_THREAD_LEAST_TEMP, *RESULT_THREAD_LEAST;
+	uint8_t *NONCE_TEMP, *NONCE_THREAD, *NONCE_THREAD_LOWEST, *BASE;
+	uint32_t *RESULT_THREAD_LOWEST_TEMP, *RESULT_THREAD_LOWEST;
 
 	cudaMallocHost(&NONCE_TEMP, NUM_BLOCKS*NUM_THREADS*NONCE_LEN);
 	cudaMalloc(&NONCE_THREAD, NUM_BLOCKS*NUM_THREADS*NONCE_LEN);
-	cudaMalloc(&NONCE_THREAD_LEAST, NUM_BLOCKS*NUM_THREADS*NONCE_LEN);
+	cudaMalloc(&NONCE_THREAD_LOWEST, NUM_BLOCKS*NUM_THREADS*NONCE_LEN);
 	cudaMalloc(&BASE, DATA_LEN);
-	cudaMallocHost(&RESULT_THREAD_LEAST_TEMP, NUM_BLOCKS*NUM_THREADS*5*4);
-	cudaMalloc(&RESULT_THREAD_LEAST, NUM_BLOCKS*NUM_THREADS*5*4);
+	cudaMallocHost(&RESULT_THREAD_LOWEST_TEMP, NUM_BLOCKS*NUM_THREADS*5*4);
+	cudaMalloc(&RESULT_THREAD_LOWEST, NUM_BLOCKS*NUM_THREADS*5*4);
 
 	log("Initializing memory");
 	for (int i = 0; i < NUM_BLOCKS*NUM_THREADS; ++i) {
 		init_nonce(NONCE_TEMP + i*NONCE_LEN);
 	}
-	memset(RESULT_THREAD_LEAST_TEMP, 0xff, NUM_BLOCKS*NUM_THREADS*5*4);
-	memcpy(DATA_LEAST, DATA, DATA_LEN);
+	memset(RESULT_THREAD_LOWEST_TEMP, 0xff, NUM_BLOCKS*NUM_THREADS*5*4);
+	memcpy(DATA_LOWEST, DATA, DATA_LEN);
 	log("Copying memory");
 	cudaMemcpy(NONCE_THREAD, NONCE_TEMP, NUM_BLOCKS*NUM_THREADS*NONCE_LEN, cudaMemcpyHostToDevice);
 	cudaMemcpy(BASE, DATA, DATA_LEN, cudaMemcpyHostToDevice);
-	cudaMemcpy(RESULT_THREAD_LEAST, RESULT_THREAD_LEAST_TEMP, NUM_BLOCKS*NUM_THREADS*5*4, cudaMemcpyHostToDevice);
+	cudaMemcpy(RESULT_THREAD_LOWEST, RESULT_THREAD_LOWEST_TEMP, NUM_BLOCKS*NUM_THREADS*5*4, cudaMemcpyHostToDevice);
 	cudaDeviceSynchronize();
 
 	//time measurement
@@ -333,11 +333,11 @@ int main(int argc, char *argv[]) {
 	log("Launching CUDA kernels");
 
 	for(;;) {
-		run_set<<<NUM_BLOCKS, NUM_THREADS>>>(BASE, NONCE_THREAD, NONCE_THREAD_LEAST, RESULT_THREAD_LEAST, DATA_LEN, PADDED_LEN, NONCE_LEN, EPOCH_COUNT);
+		run_set<<<NUM_BLOCKS, NUM_THREADS>>>(BASE, NONCE_THREAD, NONCE_THREAD_LOWEST, RESULT_THREAD_LOWEST, DATA_LEN, PADDED_LEN, NONCE_LEN, EPOCH_COUNT);
 
 		processed += (uint64_t) NUM_BLOCKS * NUM_THREADS * EPOCH_COUNT * (range_upper - range_lower + 1);
 
-		cudaMemcpy(RESULT_THREAD_LEAST_TEMP, RESULT_THREAD_LEAST, NUM_BLOCKS*NUM_THREADS*5*4, cudaMemcpyDeviceToHost);
+		cudaMemcpy(RESULT_THREAD_LOWEST_TEMP, RESULT_THREAD_LOWEST, NUM_BLOCKS*NUM_THREADS*5*4, cudaMemcpyDeviceToHost);
 
 		for (uint64_t i = 0; i < (uint64_t) NUM_BLOCKS*NUM_THREADS; ++i) {
 			if (!RESULT_THREAD_LEAST_TEMP[5*i+0]) {
