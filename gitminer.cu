@@ -16,7 +16,7 @@ using namespace std;
 #define range_lower 'a'
 #define range_upper 'z'
 
-#define data_len_max 2048
+#define data_len_max 512
 
 int g_nonce_start = 237;
 int g_nonce_end = 246;
@@ -218,7 +218,7 @@ int main(int argc, char *argv[]) {
 	uint32_t DATA_LEN;
 	char buf[1000], buf_nonce[256];
 
-	int NUM_BLOCKS = 256;
+	int NUM_BLOCKS = 1024;
 	int NUM_THREADS = 256;
 	int EPOCH_COUNT = 10000;
 
