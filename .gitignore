@@ -1,1 +1,8 @@
 base.txt
+result.txt
+commit_content.tmp
+log.txt
+log*.txt
+gitminer
+gitminer_cpu
+.omc/
