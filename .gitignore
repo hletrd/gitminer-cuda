@@ -5,4 +5,5 @@ log.txt
 log*.txt
 gitminer
 gitminer_cpu
+gitminer_metal
 .omc/

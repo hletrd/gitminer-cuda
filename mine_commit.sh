@@ -21,7 +21,6 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MINER="$SCRIPT_DIR/gitminer_cpu"
 
 TARGET_ZEROS=${1:-7}
 THREADS=${2:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}
@@ -29,8 +28,15 @@ THREADS=${2:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}
 NONCE_PLACEHOLDER="aaaaaaaaaa"
 NONCE_LEN=${#NONCE_PLACEHOLDER}
 
-if [ ! -x "$MINER" ]; then
-	echo "Error: gitminer_cpu not found. Run 'make gitminer_cpu' first." >&2
+# Auto-detect best available miner: Metal GPU > CPU
+if [ -x "$SCRIPT_DIR/gitminer_metal" ]; then
+	MINER="$SCRIPT_DIR/gitminer_metal"
+	echo "Using Metal GPU miner"
+elif [ -x "$SCRIPT_DIR/gitminer_cpu" ]; then
+	MINER="$SCRIPT_DIR/gitminer_cpu"
+	echo "Using CPU miner"
+else
+	echo "Error: no miner found. Run 'make gitminer_metal' or 'make gitminer_cpu' first." >&2
 	exit 1
 fi
 
