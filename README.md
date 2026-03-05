@@ -43,17 +43,20 @@ GPG-signed commits are supported via a PGP armor `Comment` field used as the non
 
 ## Benchmark Results
 
-| Platform | Backend | Hash Rate | Power | 7-zero time |
-|---|---|---|---|---|
-| RTX 4090 | CUDA | 27.5 GH/s | 449 W | < 1 s |
-| EPYC 7352 (48 threads) | CPU | ~500 MH/s | - | ~0.5 s |
-| Apple M4 Pro | Metal | 134 MH/s | ~15 W | ~3 s |
+Measured with a 244-byte test commit object (1 remaining SHA-1 block after pre-computation).
+
+| Platform | Backend | Hash Rate | Power |
+|---|---|---|---|
+| NVIDIA RTX 4090 | CUDA | 27.5 GH/s | 449 W |
+| Apple M4 Pro | Metal | 2.3 GH/s | ~15 W |
+| AMD EPYC 7352 (48 threads) | CPU | ~500 MH/s | - |
+| Apple M4 Pro (12 threads) | CPU | ~159 MH/s | - |
 
 Notes:
 
 - RTX 4090 achieves 100% GPU utilization (449 W / 450 W TDP)
-- RTX 4090 found 9 leading zeros in under 5 seconds
-- RTX 4090 processed 613 billion SHA-1 hashes in 30 seconds
+- RTX 4090 found 9 leading zeros in under 5 seconds, processed 613B hashes in 30s
+- Hash rate scales inversely with commit object size (more SHA-1 blocks per hash)
 - CUDA kernel: 1024 blocks x 256 threads = 262,144 threads
 - Metal kernel: 65,536 GPU threads (256 per threadgroup)
 
