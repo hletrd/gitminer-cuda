@@ -11,6 +11,11 @@
 #     Run forever finding the lowest possible hash.
 #     Press Ctrl+C to stop and apply the best result found so far.
 #
+#   mine_commit.sh incremental [prefix_length] [threads]
+#     Auto-generate a sequential hex prefix based on commit number.
+#     First commit -> 0000000, second -> 0000001, ..., 11th -> 000000a, etc.
+#     prefix_length: number of hex digits (default: 7)
+#
 #   threads: CPU threads / device ID to use (default: auto-detect)
 #
 # Must be run from within a git repository after making a commit.
@@ -40,6 +45,12 @@ case "${1:-7}" in
 		MODE="infinite"
 		TARGET_ZEROS=0
 		THREADS=${2:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}
+		;;
+	incremental)
+		MODE="incremental"
+		TARGET_ZEROS=0
+		PREFIX_LENGTH=${2:-7}
+		THREADS=${3:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}
 		;;
 	*)
 		TARGET_ZEROS=${1:-7}
@@ -81,6 +92,14 @@ fi
 
 COMMIT_HASH=$(git rev-parse HEAD)
 echo "Mining commit: $COMMIT_HASH"
+
+# ── For incremental mode, compute target prefix from commit number ──
+
+if [ "$MODE" = "incremental" ]; then
+	COMMIT_INDEX=$(( $(git rev-list --count HEAD) - 1 ))
+	TARGET_PREFIX=$(printf "%0${PREFIX_LENGTH}x" "$COMMIT_INDEX")
+	echo "Incremental mode: commit #$COMMIT_INDEX -> prefix $TARGET_PREFIX"
+fi
 
 # Check if commit is GPG-signed
 IS_SIGNED=0
@@ -210,11 +229,17 @@ echo "Nonce position: [$NONCE_POS, $NONCE_END)"
 
 # ── Display target info ──
 
-if [ "$MODE" = "infinite" ]; then
-	echo "Mode: infinite (finding lowest hash, Ctrl+C to stop)"
-else
-	echo "Target: $TARGET_ZEROS leading hex zeros"
-fi
+case "$MODE" in
+	infinite)
+		echo "Mode: infinite (finding lowest hash, Ctrl+C to stop)"
+		;;
+	incremental)
+		echo "Mode: incremental (target prefix: $TARGET_PREFIX)"
+		;;
+	*)
+		echo "Target: $TARGET_ZEROS leading hex zeros"
+		;;
+esac
 
 echo "Threads: $THREADS"
 echo "Mining..."
@@ -278,18 +303,33 @@ echo "New commit hash: $NEW_HASH"
 ZEROS=$(python3 -c "h='$NEW_HASH'; print(len(h) - len(h.lstrip('0')))")
 echo "Leading zeros: $ZEROS"
 
-if [ "$MODE" = "infinite" ]; then
-	# Always apply in infinite mode (best result found)
-	echo "Best hash found during mining session."
-	BRANCH=$(git branch --show-current)
-	if [ -n "$BRANCH" ]; then
-		git update-ref "refs/heads/$BRANCH" "$NEW_HASH"
-		echo "Success! Branch '$BRANCH' now points to $NEW_HASH"
-	else
-		git update-ref HEAD "$NEW_HASH"
-		echo "Success! HEAD now points to $NEW_HASH"
-	fi
-elif [ "$ZEROS" -ge "$TARGET_ZEROS" ]; then
+APPLY_RESULT=0
+
+case "$MODE" in
+	infinite)
+		# Always apply in infinite mode (best result found)
+		APPLY_RESULT=1
+		echo "Best hash found during mining session."
+		;;
+	incremental)
+		# Verify the prefix matches
+		ACTUAL_PREFIX=$(python3 -c "print('$NEW_HASH'[:${PREFIX_LENGTH}])")
+		if [ "$ACTUAL_PREFIX" = "$TARGET_PREFIX" ]; then
+			APPLY_RESULT=1
+		else
+			echo "Warning: hash prefix '$ACTUAL_PREFIX' does not match target '$TARGET_PREFIX'" >&2
+		fi
+		;;
+	*)
+		if [ "$ZEROS" -ge "$TARGET_ZEROS" ]; then
+			APPLY_RESULT=1
+		else
+			echo "Warning: hash only has $ZEROS leading zeros (target: $TARGET_ZEROS)" >&2
+		fi
+		;;
+esac
+
+if [ "$APPLY_RESULT" = "1" ]; then
 	BRANCH=$(git branch --show-current)
 	if [ -n "$BRANCH" ]; then
 		git update-ref "refs/heads/$BRANCH" "$NEW_HASH"
@@ -308,8 +348,6 @@ elif [ "$ZEROS" -ge "$TARGET_ZEROS" ]; then
 			echo "WARNING: GPG signature verification failed!" >&2
 		fi
 	fi
-else
-	echo "Warning: hash only has $ZEROS leading zeros (target: $TARGET_ZEROS)" >&2
 fi
 
 # Cleanup
