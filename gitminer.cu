@@ -228,6 +228,7 @@ int main(int argc, char *argv[]) {
 	if (argc > 4) { g_nonce_start = atoi(argv[4]); }
 	if (argc > 5) { g_nonce_end = atoi(argv[5]); }
 	if (argc > 6) { g_target_zeros = atoi(argv[6]); }
+	if (argc > 7) { NUM_BLOCKS = atoi(argv[7]); }
 
 	log_msg("Reading data");
 

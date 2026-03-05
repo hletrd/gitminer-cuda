@@ -24,7 +24,7 @@ make gitminer_cpu
 ## Usage
 
 ```sh
-./gitminer <gpu_id> <log_file> <result_file> <nonce_start> <nonce_end> <target_zeros>
+./gitminer <gpu_id> <log_file> <result_file> <nonce_start> <nonce_end> <target_zeros> [num_blocks]
 ./gitminer_metal <ignored> <log_file> <result_file> <nonce_start> <nonce_end> <target_zeros>
 ./gitminer_cpu <num_threads> <log_file> <result_file> <nonce_start> <nonce_end> <target_zeros>
 ```
@@ -49,6 +49,9 @@ Measured with a 244-byte test commit object (1 remaining SHA-1 block after pre-c
 |---|---|---|
 | NVIDIA RTX 5090 | CUDA | 46.9 GH/s |
 | NVIDIA RTX 4090 | CUDA | 27.5 GH/s |
+| NVIDIA H100 SXM5 80GB | CUDA | 21.6 GH/s |
+| NVIDIA A100 PCIe 80GB | CUDA | 12.2 GH/s |
+| NVIDIA A100 PCIe 40GB | CUDA | 11.9 GH/s |
 | NVIDIA RTX 2080 Ti | CUDA | 9.0 GH/s |
 | Apple M4 Pro | Metal | 2.3 GH/s |
 | AMD EPYC 7352 (48 threads) | CPU | ~500 MH/s |
@@ -61,6 +64,7 @@ Notes:
 - Hash rate scales inversely with commit object size (more SHA-1 blocks per hash)
 - CUDA kernel: 1024 blocks x 256 threads = 262,144 threads
 - Metal kernel: 65,536 GPU threads (256 per threadgroup)
+- Data center GPUs (H100, A100) have lower INT32 throughput than consumer GPUs due to lower clock speeds (H100: 1980 MHz, A100: 1410 MHz vs RTX 4090: 2520 MHz), despite having more SMs
 
 ## Integration
 
