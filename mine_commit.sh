@@ -2,13 +2,20 @@
 #
 # mine_commit.sh - Mine a git commit hash with leading zeros
 #
-# Usage: mine_commit.sh [target_zeros] [threads]
-#   target_zeros: number of leading hex zeros (default: 7)
-#   threads:      CPU threads to use (default: auto-detect)
+# Usage: mine_commit.sh [mode] [args...]
+#
+#   mine_commit.sh [target_zeros] [threads]
+#     Mine for N leading hex zeros (default: 7).
+#
+#   mine_commit.sh infinite [threads]
+#     Run forever finding the lowest possible hash.
+#     Press Ctrl+C to stop and apply the best result found so far.
+#
+#   threads: CPU threads / device ID to use (default: auto-detect)
 #
 # Must be run from within a git repository after making a commit.
 # The most recent commit will be re-created with a nonce that produces
-# a hash with the desired number of leading zeros.
+# a hash matching the target.
 #
 # For GPG-signed commits: the nonce is placed in a PGP armor Comment
 # header, which does NOT invalidate the cryptographic signature but
@@ -22,14 +29,38 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-TARGET_ZEROS=${1:-7}
-THREADS=${2:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}
+# ── Parse mode and arguments ──
+
+MODE="zeros"
+TARGET_ZEROS=7
+TARGET_PREFIX=""
+
+case "${1:-7}" in
+	infinite)
+		MODE="infinite"
+		TARGET_ZEROS=0
+		THREADS=${2:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}
+		;;
+	*)
+		TARGET_ZEROS=${1:-7}
+		THREADS=${2:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}
+		;;
+esac
 
 NONCE_PLACEHOLDER="aaaaaaaaaa"
 NONCE_LEN=${#NONCE_PLACEHOLDER}
 
-# Auto-detect best available miner: Metal GPU > OpenCL GPU > CPU
-if [ -x "$SCRIPT_DIR/gitminer_metal" ]; then
+# ── Auto-detect best available miner ──
+
+IS_CUDA=0
+if [ -x "$SCRIPT_DIR/gitminer" ]; then
+	MINER="$SCRIPT_DIR/gitminer"
+	IS_CUDA=1
+	echo "Using CUDA GPU miner"
+elif [ -x "$SCRIPT_DIR/gitminer_vulkan" ]; then
+	MINER="$SCRIPT_DIR/gitminer_vulkan"
+	echo "Using Vulkan GPU miner"
+elif [ -x "$SCRIPT_DIR/gitminer_metal" ]; then
 	MINER="$SCRIPT_DIR/gitminer_metal"
 	echo "Using Metal GPU miner"
 elif [ -x "$SCRIPT_DIR/gitminer_opencl" ]; then
@@ -176,14 +207,57 @@ fi
 
 NONCE_END=$((NONCE_POS + NONCE_LEN))
 echo "Nonce position: [$NONCE_POS, $NONCE_END)"
-echo "Target: $TARGET_ZEROS leading hex zeros"
+
+# ── Display target info ──
+
+if [ "$MODE" = "infinite" ]; then
+	echo "Mode: infinite (finding lowest hash, Ctrl+C to stop)"
+else
+	echo "Target: $TARGET_ZEROS leading hex zeros"
+fi
+
 echo "Threads: $THREADS"
 echo "Mining..."
 
-# Run the miner
-"$MINER" "$THREADS" /dev/stderr result.txt "$NONCE_POS" "$NONCE_END" "$TARGET_ZEROS" 2>&1
+# ── Build miner arguments ──
+
+MINER_ARGS=("$THREADS" /dev/stderr result.txt "$NONCE_POS" "$NONCE_END" "$TARGET_ZEROS")
+
+if [ -n "$TARGET_PREFIX" ]; then
+	if [ "$IS_CUDA" = "1" ]; then
+		MINER_ARGS+=(1024 "$TARGET_PREFIX")
+	else
+		MINER_ARGS+=("$TARGET_PREFIX")
+	fi
+fi
+
+# ── Run the miner ──
+
+if [ "$MODE" = "infinite" ]; then
+	# Run in background so we can trap Ctrl+C and apply best result
+	"$MINER" "${MINER_ARGS[@]}" 2>&1 &
+	MINER_PID=$!
+	cleanup() {
+		echo ""
+		echo "Stopping miner (PID $MINER_PID)..."
+		kill "$MINER_PID" 2>/dev/null || true
+		wait "$MINER_PID" 2>/dev/null || true
+	}
+	trap cleanup INT TERM
+	wait "$MINER_PID" 2>/dev/null || true
+	trap - INT TERM
+else
+	"$MINER" "${MINER_ARGS[@]}" 2>&1
+fi
+
+# ── Process result ──
 
 if [ ! -f result.txt ]; then
+	if [ "$MODE" = "infinite" ]; then
+		echo "No result found (miner was stopped before finding any hash)." >&2
+		rm -f base.txt
+		exit 1
+	fi
 	echo "Error: miner did not produce result.txt" >&2
 	exit 1
 fi
@@ -204,7 +278,18 @@ echo "New commit hash: $NEW_HASH"
 ZEROS=$(python3 -c "h='$NEW_HASH'; print(len(h) - len(h.lstrip('0')))")
 echo "Leading zeros: $ZEROS"
 
-if [ "$ZEROS" -ge "$TARGET_ZEROS" ]; then
+if [ "$MODE" = "infinite" ]; then
+	# Always apply in infinite mode (best result found)
+	echo "Best hash found during mining session."
+	BRANCH=$(git branch --show-current)
+	if [ -n "$BRANCH" ]; then
+		git update-ref "refs/heads/$BRANCH" "$NEW_HASH"
+		echo "Success! Branch '$BRANCH' now points to $NEW_HASH"
+	else
+		git update-ref HEAD "$NEW_HASH"
+		echo "Success! HEAD now points to $NEW_HASH"
+	fi
+elif [ "$ZEROS" -ge "$TARGET_ZEROS" ]; then
 	BRANCH=$(git branch --show-current)
 	if [ -n "$BRANCH" ]; then
 		git update-ref "refs/heads/$BRANCH" "$NEW_HASH"
