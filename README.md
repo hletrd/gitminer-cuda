@@ -49,6 +49,7 @@ Measured with a 244-byte test commit object (1 remaining SHA-1 block after pre-c
 |---|---|---|
 | NVIDIA RTX 5090 | CUDA | 46.9 GH/s |
 | NVIDIA RTX 4090 | CUDA | 27.5 GH/s |
+| NVIDIA RTX 2080 Ti | CUDA | 9.0 GH/s |
 | Apple M4 Pro | Metal | 2.3 GH/s |
 | AMD EPYC 7352 (48 threads) | CPU | ~500 MH/s |
 | AMD Ryzen 7 9700X (16 threads) | CPU | ~174 MH/s |
