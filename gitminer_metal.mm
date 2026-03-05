@@ -23,6 +23,35 @@ int g_target_zeros = 0;
 int logmode = 1;
 string filename_log, filename_out;
 
+string g_target_prefix_str;
+uint32_t g_prefix[5] = {0};
+uint32_t g_prefix_mask[5] = {0};
+int g_prefix_mode = 0;
+
+void parse_hex_prefix(const char *hex, uint32_t *prefix, uint32_t *mask) {
+	memset(prefix, 0, 5 * sizeof(uint32_t));
+	memset(mask, 0, 5 * sizeof(uint32_t));
+	int len = strlen(hex);
+	for (int i = 0; i < len && i < 40; i++) {
+		int word = i / 8;
+		int shift = (7 - (i % 8)) * 4;
+		char c = hex[i];
+		uint8_t val;
+		if (c >= '0' && c <= '9') val = c - '0';
+		else if (c >= 'a' && c <= 'f') val = c - 'a' + 10;
+		else if (c >= 'A' && c <= 'F') val = c - 'A' + 10;
+		else { fprintf(stderr, "Invalid hex character: %c\n", c); exit(1); }
+		prefix[word] |= (uint32_t)val << shift;
+		mask[word] |= (uint32_t)0xF << shift;
+	}
+}
+
+inline bool matches_prefix(const uint32_t *hash, const uint32_t *prefix, const uint32_t *mask) {
+	for (int i = 0; i < 5; i++)
+		if ((hash[i] & mask[i]) != prefix[i]) return false;
+	return true;
+}
+
 // ── Host-side SHA-1 (for pre-compute cache) ──────────────────────────
 
 #define rol(x, n) (((x)<<(n))|((x)>>(32-(n))))
@@ -194,6 +223,9 @@ struct MineParams {
 	uint nonce_block_start;
 	uint padded_len;
 	uint nonce_size;
+	uint prefix_mode;
+	uint prefix0; uint prefix1; uint prefix2; uint prefix3; uint prefix4;
+	uint mask0; uint mask1; uint mask2; uint mask3; uint mask4;
 };
 
 kernel void mine_sha1(
@@ -203,6 +235,7 @@ kernel void mine_sha1(
 	device uint32_t *best_results [[buffer(3)]],
 	device uint8_t *best_nonces [[buffer(4)]],
 	constant MineParams &params [[buffer(5)]],
+	device atomic_uint *found_flag [[buffer(6)]],
 	uint tid [[thread_position_in_grid]]
 ) {
 	uint nonce_start = params.nonce_start;
@@ -234,6 +267,7 @@ kernel void mine_sha1(
 	uint8_t temp_block[64];
 
 	for (uint ep = 0; ep < epoch_count; ep++) {
+		if (params.prefix_mode && atomic_load_explicit((device atomic_uint*)found_flag, memory_order_relaxed)) break;
 		for (int j = RANGE_LOWER; j <= RANGE_UPPER; j++) {
 			nonce_block[nonce_offset] = (uint8_t)j;
 
@@ -250,16 +284,31 @@ kernel void mine_sha1(
 				sha1_block_impl(temp_block, result);
 			}
 
-			// Check if lower
-			bool lower = false;
-			for (int k = 0; k < 5; k++) {
-				if (result[k] < local_best[k]) { lower = true; break; }
-				if (result[k] > local_best[k]) { break; }
-			}
-			if (lower) {
-				for (int k = 0; k < 5; k++) local_best[k] = result[k];
-				local_best_nonce[0] = (uint8_t)j;
-				for (uint i = 1; i < nonce_size; i++) local_best_nonce[i] = my_nonce[i];
+			// Check if lower or prefix match
+			if (params.prefix_mode) {
+				uint prefix_arr[5] = {params.prefix0, params.prefix1, params.prefix2, params.prefix3, params.prefix4};
+				uint mask_arr[5] = {params.mask0, params.mask1, params.mask2, params.mask3, params.mask4};
+				bool match = true;
+				for (int k = 0; k < 5; k++) {
+					if ((result[k] & mask_arr[k]) != prefix_arr[k]) { match = false; break; }
+				}
+				if (match) {
+					for (int k = 0; k < 5; k++) local_best[k] = result[k];
+					local_best_nonce[0] = (uint8_t)j;
+					for (uint i = 1; i < nonce_size; i++) local_best_nonce[i] = my_nonce[i];
+					atomic_store_explicit((device atomic_uint*)found_flag, 1, memory_order_relaxed);
+				}
+			} else {
+				bool lower = false;
+				for (int k = 0; k < 5; k++) {
+					if (result[k] < local_best[k]) { lower = true; break; }
+					if (result[k] > local_best[k]) { break; }
+				}
+				if (lower) {
+					for (int k = 0; k < 5; k++) local_best[k] = result[k];
+					local_best_nonce[0] = (uint8_t)j;
+					for (uint i = 1; i < nonce_size; i++) local_best_nonce[i] = my_nonce[i];
+				}
 			}
 		}
 
@@ -301,6 +350,11 @@ int main(int argc, char *argv[]) {
 	if (argc > 4) { g_nonce_start = atoi(argv[4]); }
 	if (argc > 5) { g_nonce_end = atoi(argv[5]); }
 	if (argc > 6) { g_target_zeros = atoi(argv[6]); }
+	if (argc > 7) {
+		g_target_prefix_str = argv[7];
+		parse_hex_prefix(argv[7], g_prefix, g_prefix_mask);
+		g_prefix_mode = 1;
+	}
 
 	// Read base.txt
 	log_msg("Reading data");
@@ -369,6 +423,8 @@ int main(int argc, char *argv[]) {
 	log_msg("Nonce region: [" + to_string(g_nonce_start) + ", " + to_string(g_nonce_end) + ")");
 	if (g_target_zeros > 0)
 		log_msg("Target: " + to_string(g_target_zeros) + " leading hex zeros");
+	if (g_prefix_mode)
+		log_msg("Target prefix: " + g_target_prefix_str);
 
 	// Create buffers
 	id<MTLBuffer> dataBuf = [device newBufferWithBytes:DATA.data()
@@ -381,6 +437,8 @@ int main(int argc, char *argv[]) {
 		options:MTLResourceStorageModeShared];
 	id<MTLBuffer> bestNonceBuf = [device newBufferWithLength:NUM_THREADS * NONCE_LEN
 		options:MTLResourceStorageModeShared];
+	id<MTLBuffer> foundBuf = [device newBufferWithLength:sizeof(uint32_t)
+		options:MTLResourceStorageModeShared];
 
 	struct {
 		uint32_t nonce_start;
@@ -389,10 +447,16 @@ int main(int argc, char *argv[]) {
 		uint32_t nonce_block_start;
 		uint32_t padded_len;
 		uint32_t nonce_size;
+		uint32_t prefix_mode;
+		uint32_t prefix0, prefix1, prefix2, prefix3, prefix4;
+		uint32_t mask0, mask1, mask2, mask3, mask4;
 	} params = {
 		(uint32_t)g_nonce_start, (uint32_t)g_nonce_end,
 		(uint32_t)EPOCH_COUNT, (uint32_t)nonce_block_start,
-		PADDED_LEN, NONCE_LEN
+		PADDED_LEN, NONCE_LEN,
+		(uint32_t)g_prefix_mode,
+		g_prefix[0], g_prefix[1], g_prefix[2], g_prefix[3], g_prefix[4],
+		g_prefix_mask[0], g_prefix_mask[1], g_prefix_mask[2], g_prefix_mask[3], g_prefix_mask[4]
 	};
 	id<MTLBuffer> paramBuf = [device newBufferWithBytes:&params
 		length:sizeof(params) options:MTLResourceStorageModeShared];
@@ -419,12 +483,14 @@ int main(int argc, char *argv[]) {
 			id<MTLCommandBuffer> cmdBuf = [commandQueue commandBuffer];
 			id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
 			[encoder setComputePipelineState:pipeline];
+			*(uint32_t*)[foundBuf contents] = 0;
 			[encoder setBuffer:dataBuf offset:0 atIndex:0];
 			[encoder setBuffer:stateBuf offset:0 atIndex:1];
 			[encoder setBuffer:nonceBuf offset:0 atIndex:2];
 			[encoder setBuffer:resultBuf offset:0 atIndex:3];
 			[encoder setBuffer:bestNonceBuf offset:0 atIndex:4];
 			[encoder setBuffer:paramBuf offset:0 atIndex:5];
+			[encoder setBuffer:foundBuf offset:0 atIndex:6];
 
 			MTLSize gridSize = MTLSizeMake(NUM_THREADS, 1, 1);
 			MTLSize tgSize = MTLSizeMake(threadgroupSize, 1, 1);
@@ -441,26 +507,47 @@ int main(int argc, char *argv[]) {
 		uint8_t *bestNonces = (uint8_t*)[bestNonceBuf contents];
 
 		for (int i = 0; i < NUM_THREADS; i++) {
-			if (is_lower_hash(results + i * 5, RESULT_LOWEST)) {
-				memcpy(RESULT_LOWEST, results + i * 5, 5 * 4);
-				memcpy(DATA_LOWEST.data() + g_nonce_start, bestNonces + i * NONCE_LEN, NONCE_LEN);
+			if (g_prefix_mode) {
+				if (matches_prefix(results + i * 5, g_prefix, g_prefix_mask)) {
+					memcpy(RESULT_LOWEST, results + i * 5, 5 * 4);
+					memcpy(DATA_LOWEST.data() + g_nonce_start, bestNonces + i * NONCE_LEN, NONCE_LEN);
 
-				char buf_nonce[256];
-				for (uint32_t j = 0; j < NONCE_LEN; j++)
-					buf_nonce[j] = DATA_LOWEST[g_nonce_start + j];
-				buf_nonce[NONCE_LEN] = 0;
-				snprintf(buf, sizeof(buf), "Found new lowest value: %08x%08x%08x%08x%08x (nonce: %s)",
-					RESULT_LOWEST[0], RESULT_LOWEST[1], RESULT_LOWEST[2],
-					RESULT_LOWEST[3], RESULT_LOWEST[4], buf_nonce);
-				log_msg(buf);
+					char buf_nonce[256];
+					for (uint32_t j = 0; j < NONCE_LEN; j++)
+						buf_nonce[j] = DATA_LOWEST[g_nonce_start + j];
+					buf_nonce[NONCE_LEN] = 0;
+					snprintf(buf, sizeof(buf), "Found prefix match: %08x%08x%08x%08x%08x (nonce: %s)",
+						RESULT_LOWEST[0], RESULT_LOWEST[1], RESULT_LOWEST[2],
+						RESULT_LOWEST[3], RESULT_LOWEST[4], buf_nonce);
+					log_msg(buf);
 
-				ofstream file_out;
-				file_out.open(filename_out, ios::out | ios::binary);
-				file_out.write((char*)DATA_LOWEST.data(), DATA_LEN);
-				file_out.close();
-
-				if (g_target_zeros > 0 && has_leading_zeros(RESULT_LOWEST, g_target_zeros)) {
+					ofstream file_out;
+					file_out.open(filename_out, ios::out | ios::binary);
+					file_out.write((char*)DATA_LOWEST.data(), DATA_LEN);
+					file_out.close();
 					found = true;
+				}
+			} else {
+				if (is_lower_hash(results + i * 5, RESULT_LOWEST)) {
+					memcpy(RESULT_LOWEST, results + i * 5, 5 * 4);
+					memcpy(DATA_LOWEST.data() + g_nonce_start, bestNonces + i * NONCE_LEN, NONCE_LEN);
+
+					char buf_nonce[256];
+					for (uint32_t j = 0; j < NONCE_LEN; j++)
+						buf_nonce[j] = DATA_LOWEST[g_nonce_start + j];
+					buf_nonce[NONCE_LEN] = 0;
+					snprintf(buf, sizeof(buf), "Found new lowest value: %08x%08x%08x%08x%08x (nonce: %s)",
+						RESULT_LOWEST[0], RESULT_LOWEST[1], RESULT_LOWEST[2],
+						RESULT_LOWEST[3], RESULT_LOWEST[4], buf_nonce);
+					log_msg(buf);
+
+					ofstream file_out;
+					file_out.open(filename_out, ios::out | ios::binary);
+					file_out.write((char*)DATA_LOWEST.data(), DATA_LEN);
+					file_out.close();
+
+					if (g_target_zeros > 0 && has_leading_zeros(RESULT_LOWEST, g_target_zeros))
+						found = true;
 				}
 			}
 		}

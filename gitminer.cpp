@@ -31,6 +31,35 @@ int logmode = 1;
 string filename_log, filename_out;
 atomic<bool> g_found(false);
 
+uint32_t g_prefix[5] = {0};
+uint32_t g_prefix_mask[5] = {0};
+int g_prefix_mode = 0;
+string g_target_prefix_str;
+
+void parse_hex_prefix(const char *hex, uint32_t *prefix, uint32_t *mask) {
+	memset(prefix, 0, 5 * sizeof(uint32_t));
+	memset(mask, 0, 5 * sizeof(uint32_t));
+	int len = strlen(hex);
+	for (int i = 0; i < len && i < 40; i++) {
+		int word = i / 8;
+		int shift = (7 - (i % 8)) * 4;
+		char c = hex[i];
+		uint8_t val;
+		if (c >= '0' && c <= '9') val = c - '0';
+		else if (c >= 'a' && c <= 'f') val = c - 'a' + 10;
+		else if (c >= 'A' && c <= 'F') val = c - 'A' + 10;
+		else { fprintf(stderr, "Invalid hex character: %c\n", c); exit(1); }
+		prefix[word] |= (uint32_t)val << shift;
+		mask[word] |= (uint32_t)0xF << shift;
+	}
+}
+
+inline bool matches_prefix(const uint32_t *hash, const uint32_t *prefix, const uint32_t *mask) {
+	for (int i = 0; i < 5; i++)
+		if ((hash[i] & mask[i]) != prefix[i]) return false;
+	return true;
+}
+
 #define rol(x, n) (((x)<<(n))|((x)>>(32-(n))))
 
 #if BYTE_ORDER == LITTLE_ENDIAN
@@ -182,9 +211,37 @@ void run_set_thread(uint8_t *data_input, uint8_t *nonce, int data_len, int nonce
 				sha1_block(data + blk, result);
 			}
 
-			if (is_lower_hash(result, local_best_result)) {
-				memcpy(local_best_result, result, 5 * 4);
-				memcpy(local_best_nonce, data + nonce_start, nonce_size);
+			if (g_prefix_mode) {
+				if (matches_prefix(result, g_prefix, g_prefix_mask)) {
+					memcpy(local_best_result, result, 5 * 4);
+					memcpy(local_best_nonce, data + nonce_start, nonce_size);
+					// Immediately report prefix match
+					lock_guard<mutex> lock(result_mutex);
+					memcpy(global_result_lowest, local_best_result, 5 * 4);
+					memcpy(global_data_lowest + nonce_start, local_best_nonce, nonce_size);
+
+					char buf2[1000], buf_nonce2[256];
+					for (int j2 = 0; j2 < nonce_size; ++j2)
+						buf_nonce2[j2] = global_data_lowest[nonce_start + j2];
+					buf_nonce2[nonce_size] = 0;
+					snprintf(buf2, sizeof(buf2), "Found prefix match: %08x%08x%08x%08x%08x (nonce: %s)",
+						global_result_lowest[0], global_result_lowest[1], global_result_lowest[2],
+						global_result_lowest[3], global_result_lowest[4], buf_nonce2);
+					log_msg(buf2);
+
+					ofstream file_out2;
+					file_out2.open(filename_out, ios::out | ios::binary);
+					file_out2.write((char*)global_data_lowest, data_len_original);
+					file_out2.close();
+
+					g_found.store(true, memory_order_relaxed);
+					return;
+				}
+			} else {
+				if (is_lower_hash(result, local_best_result)) {
+					memcpy(local_best_result, result, 5 * 4);
+					memcpy(local_best_nonce, data + nonce_start, nonce_size);
+				}
 			}
 		}
 
@@ -298,6 +355,11 @@ int main(int argc, char *argv[]) {
 	if (argc > 6) {
 		g_target_zeros = atoi(argv[6]);
 	}
+	if (argc > 7) {
+		g_target_prefix_str = argv[7];
+		parse_hex_prefix(argv[7], g_prefix, g_prefix_mask);
+		g_prefix_mode = 1;
+	}
 
 	log_msg("Reading data");
 
@@ -334,7 +396,9 @@ int main(int argc, char *argv[]) {
 
 	log_msg("Using " + to_string(NUM_THREADS) + " CPU threads");
 	log_msg("Nonce region: [" + to_string(g_nonce_start) + ", " + to_string(g_nonce_end) + ") length=" + to_string(NONCE_LEN));
-	if (g_target_zeros > 0) {
+	if (g_prefix_mode) {
+		log_msg("Target prefix: " + g_target_prefix_str);
+	} else if (g_target_zeros > 0) {
 		log_msg("Target: " + to_string(g_target_zeros) + " leading hex zeros");
 	} else {
 		log_msg("Target: run forever (find lowest hash)");

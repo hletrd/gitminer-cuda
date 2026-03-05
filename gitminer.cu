@@ -24,6 +24,29 @@ int g_target_zeros = 0;
 int logmode = 1;
 string filename_log, filename_out;
 
+string g_target_prefix_str;
+uint32_t g_prefix[5] = {0};
+uint32_t g_prefix_mask[5] = {0};
+int g_prefix_mode = 0;
+
+void parse_hex_prefix(const char *hex, uint32_t *prefix, uint32_t *mask) {
+	memset(prefix, 0, 5 * sizeof(uint32_t));
+	memset(mask, 0, 5 * sizeof(uint32_t));
+	int len = strlen(hex);
+	for (int i = 0; i < len && i < 40; i++) {
+		int word = i / 8;
+		int shift = (7 - (i % 8)) * 4;
+		char c = hex[i];
+		uint8_t val;
+		if (c >= '0' && c <= '9') val = c - '0';
+		else if (c >= 'a' && c <= 'f') val = c - 'a' + 10;
+		else if (c >= 'A' && c <= 'F') val = c - 'A' + 10;
+		else { fprintf(stderr, "Invalid hex character: %c\n", c); exit(1); }
+		prefix[word] |= (uint32_t)val << shift;
+		mask[word] |= (uint32_t)0xF << shift;
+	}
+}
+
 #define CUDA_CHECK(call) do { \
 	cudaError_t err = call; \
 	if (err != cudaSuccess) { \
@@ -115,10 +138,13 @@ __device__ inline bool is_lower_hash(const uint32_t *a, const uint32_t *b) {
 	return false;
 }
 
+__constant__ uint32_t c_prefix[5];
+__constant__ uint32_t c_prefix_mask[5];
+
 __global__ void run_set(
 	uint8_t *data_input, uint8_t *nonces, uint8_t *best_nonces,
-	uint32_t *best_results, int data_len, int nonce_size,
-	int epoch_count, int nonce_start, int nonce_block_start)
+	uint32_t *best_results, int *found_flag, int data_len, int nonce_size,
+	int epoch_count, int nonce_start, int nonce_block_start, int prefix_mode)
 {
 	int tid = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -142,6 +168,8 @@ __global__ void run_set(
 	uint32_t result[5];
 
 	for (int ep = 0; ep < epoch_count; ++ep) {
+		if (prefix_mode && *found_flag) break;
+
 		for (int j = range_lower; j <= range_upper; ++j) {
 			data[nonce_start] = (uint8_t)j;
 
@@ -151,9 +179,24 @@ __global__ void run_set(
 			for (int blk = nonce_block_start; blk < padded_len; blk += 64)
 				sha1_block(data + blk, result);
 
-			if (is_lower_hash(result, best_results + tid * 5)) {
-				memcpy_device(best_nonces + tid * nonce_size, data + nonce_start, nonce_size);
-				memcpy_device(best_results + tid * 5, result, 5 * 4);
+			if (prefix_mode) {
+				bool match = true;
+				for (int k = 0; k < 5; k++) {
+					if ((result[k] & c_prefix_mask[k]) != c_prefix[k]) {
+						match = false;
+						break;
+					}
+				}
+				if (match) {
+					memcpy_device(best_nonces + tid * nonce_size, data + nonce_start, nonce_size);
+					memcpy_device(best_results + tid * 5, result, 5 * 4);
+					atomicExch(found_flag, 1);
+				}
+			} else {
+				if (is_lower_hash(result, best_results + tid * 5)) {
+					memcpy_device(best_nonces + tid * nonce_size, data + nonce_start, nonce_size);
+					memcpy_device(best_results + tid * 5, result, 5 * 4);
+				}
 			}
 		}
 
@@ -229,6 +272,11 @@ int main(int argc, char *argv[]) {
 	if (argc > 5) { g_nonce_end = atoi(argv[5]); }
 	if (argc > 6) { g_target_zeros = atoi(argv[6]); }
 	if (argc > 7) { NUM_BLOCKS = atoi(argv[7]); }
+	if (argc > 8) {
+		g_target_prefix_str = argv[8];
+		parse_hex_prefix(argv[8], g_prefix, g_prefix_mask);
+		g_prefix_mode = 1;
+	}
 
 	log_msg("Reading data");
 
@@ -275,6 +323,9 @@ int main(int argc, char *argv[]) {
 	CUDA_CHECK(cudaMalloc(&d_best_nonces, total_threads * NONCE_LEN));
 	CUDA_CHECK(cudaMalloc(&d_best_results, total_threads * 5 * sizeof(uint32_t)));
 
+	int *d_found_flag;
+	CUDA_CHECK(cudaMalloc(&d_found_flag, sizeof(int)));
+
 	// Host buffers
 	uint8_t *h_nonces = (uint8_t*)malloc(total_threads * NONCE_LEN);
 	uint32_t *h_best_results = (uint32_t*)malloc(total_threads * 5 * sizeof(uint32_t));
@@ -289,6 +340,12 @@ int main(int argc, char *argv[]) {
 	CUDA_CHECK(cudaMemcpy(d_best_results, h_best_results, total_threads * 5 * sizeof(uint32_t), cudaMemcpyHostToDevice));
 	CUDA_CHECK(cudaDeviceSynchronize());
 
+	if (g_prefix_mode) {
+		CUDA_CHECK(cudaMemcpyToSymbol(c_prefix, g_prefix, 5 * sizeof(uint32_t)));
+		CUDA_CHECK(cudaMemcpyToSymbol(c_prefix_mask, g_prefix_mask, 5 * sizeof(uint32_t)));
+		log_msg("Target prefix: " + g_target_prefix_str);
+	}
+
 	auto begin = chrono::high_resolution_clock::now();
 	auto begin_log = chrono::high_resolution_clock::now();
 	uint64_t processed = 0, processed_last = 0;
@@ -297,9 +354,13 @@ int main(int argc, char *argv[]) {
 	log_msg("Launching CUDA kernels");
 
 	for (;;) {
+		int h_found_flag = 0;
+		CUDA_CHECK(cudaMemcpy(d_found_flag, &h_found_flag, sizeof(int), cudaMemcpyHostToDevice));
+
 		run_set<<<NUM_BLOCKS, NUM_THREADS>>>(
-			d_data, d_nonces, d_best_nonces, d_best_results,
-			DATA_LEN, NONCE_LEN, EPOCH_COUNT, g_nonce_start, nonce_block_start);
+			d_data, d_nonces, d_best_nonces, d_best_results, d_found_flag,
+			DATA_LEN, NONCE_LEN, EPOCH_COUNT, g_nonce_start, nonce_block_start,
+			g_prefix_mode);
 
 		// Check for kernel launch errors
 		CUDA_CHECK(cudaGetLastError());
@@ -313,26 +374,56 @@ int main(int argc, char *argv[]) {
 			total_threads * NONCE_LEN, cudaMemcpyDeviceToHost));
 
 		for (uint64_t i = 0; i < total_threads; ++i) {
-			if (is_lower_hash_host(h_best_results + 5 * i, RESULT_LOWEST)) {
-				memcpy(RESULT_LOWEST, h_best_results + 5 * i, 5 * 4);
-				memcpy(DATA_LOWEST + g_nonce_start, h_best_nonces + i * NONCE_LEN, NONCE_LEN);
+			if (g_prefix_mode) {
+				bool match = true;
+				for (int k = 0; k < 5; k++) {
+					if ((h_best_results[i * 5 + k] & g_prefix_mask[k]) != g_prefix[k]) {
+						match = false;
+						break;
+					}
+				}
+				if (match) {
+					memcpy(RESULT_LOWEST, h_best_results + 5 * i, 5 * 4);
+					memcpy(DATA_LOWEST + g_nonce_start, h_best_nonces + i * NONCE_LEN, NONCE_LEN);
 
-				for (uint32_t j = 0; j < NONCE_LEN; j++)
-					buf_nonce[j] = DATA_LOWEST[g_nonce_start + j];
-				buf_nonce[NONCE_LEN] = 0;
-				snprintf(buf, sizeof(buf),
-					"Found new lowest: %08x%08x%08x%08x%08x (nonce: %s)",
-					RESULT_LOWEST[0], RESULT_LOWEST[1], RESULT_LOWEST[2],
-					RESULT_LOWEST[3], RESULT_LOWEST[4], buf_nonce);
-				log_msg(buf);
+					for (uint32_t j = 0; j < NONCE_LEN; j++)
+						buf_nonce[j] = DATA_LOWEST[g_nonce_start + j];
+					buf_nonce[NONCE_LEN] = 0;
+					snprintf(buf, sizeof(buf),
+						"Found prefix match: %08x%08x%08x%08x%08x (nonce: %s)",
+						RESULT_LOWEST[0], RESULT_LOWEST[1], RESULT_LOWEST[2],
+						RESULT_LOWEST[3], RESULT_LOWEST[4], buf_nonce);
+					log_msg(buf);
 
-				ofstream file_out;
-				file_out.open(filename_out, ios::out | ios::binary);
-				file_out.write((char*)DATA_LOWEST, DATA_LEN);
-				file_out.close();
+					ofstream file_out;
+					file_out.open(filename_out, ios::out | ios::binary);
+					file_out.write((char*)DATA_LOWEST, DATA_LEN);
+					file_out.close();
 
-				if (g_target_zeros > 0 && has_leading_zeros(RESULT_LOWEST, g_target_zeros))
 					found = true;
+				}
+			} else {
+				if (is_lower_hash_host(h_best_results + 5 * i, RESULT_LOWEST)) {
+					memcpy(RESULT_LOWEST, h_best_results + 5 * i, 5 * 4);
+					memcpy(DATA_LOWEST + g_nonce_start, h_best_nonces + i * NONCE_LEN, NONCE_LEN);
+
+					for (uint32_t j = 0; j < NONCE_LEN; j++)
+						buf_nonce[j] = DATA_LOWEST[g_nonce_start + j];
+					buf_nonce[NONCE_LEN] = 0;
+					snprintf(buf, sizeof(buf),
+						"Found new lowest: %08x%08x%08x%08x%08x (nonce: %s)",
+						RESULT_LOWEST[0], RESULT_LOWEST[1], RESULT_LOWEST[2],
+						RESULT_LOWEST[3], RESULT_LOWEST[4], buf_nonce);
+					log_msg(buf);
+
+					ofstream file_out;
+					file_out.open(filename_out, ios::out | ios::binary);
+					file_out.write((char*)DATA_LOWEST, DATA_LEN);
+					file_out.close();
+
+					if (g_target_zeros > 0 && has_leading_zeros(RESULT_LOWEST, g_target_zeros))
+						found = true;
+				}
 			}
 		}
 
@@ -353,7 +444,7 @@ int main(int argc, char *argv[]) {
 		}
 	}
 
-	cudaFree(d_data); cudaFree(d_nonces); cudaFree(d_best_nonces); cudaFree(d_best_results);
+	cudaFree(d_data); cudaFree(d_nonces); cudaFree(d_best_nonces); cudaFree(d_best_results); cudaFree(d_found_flag);
 	free(h_nonces); free(h_best_results); free(h_best_nonces);
 	free(DATA); free(DATA_LOWEST);
 
