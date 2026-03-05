@@ -28,15 +28,18 @@ THREADS=${2:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}
 NONCE_PLACEHOLDER="aaaaaaaaaa"
 NONCE_LEN=${#NONCE_PLACEHOLDER}
 
-# Auto-detect best available miner: Metal GPU > CPU
+# Auto-detect best available miner: Metal GPU > OpenCL GPU > CPU
 if [ -x "$SCRIPT_DIR/gitminer_metal" ]; then
 	MINER="$SCRIPT_DIR/gitminer_metal"
 	echo "Using Metal GPU miner"
+elif [ -x "$SCRIPT_DIR/gitminer_opencl" ]; then
+	MINER="$SCRIPT_DIR/gitminer_opencl"
+	echo "Using OpenCL GPU miner"
 elif [ -x "$SCRIPT_DIR/gitminer_cpu" ]; then
 	MINER="$SCRIPT_DIR/gitminer_cpu"
 	echo "Using CPU miner"
 else
-	echo "Error: no miner found. Run 'make gitminer_metal' or 'make gitminer_cpu' first." >&2
+	echo "Error: no miner found. Run 'make gitminer_metal', 'make gitminer_opencl', or 'make gitminer_cpu' first." >&2
 	exit 1
 fi
 
