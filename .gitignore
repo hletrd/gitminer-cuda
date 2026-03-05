@@ -6,4 +6,7 @@ log*.txt
 gitminer
 gitminer_cpu
 gitminer_metal
+gitminer_opencl
+gitminer_vulkan
+sha1_kernel.spv
 .omc/

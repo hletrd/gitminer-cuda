@@ -1,0 +1,312 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer DataBuf { uint data_padded[]; };
+layout(std430, binding = 1) readonly buffer StateBuf { uint state_cache[5]; };
+layout(std430, binding = 2) buffer NonceBuf { uint nonces[]; };
+layout(std430, binding = 3) buffer ResultBuf { uint best_results[]; };
+layout(std430, binding = 4) buffer BestNonceBuf { uint best_nonces[]; };
+
+layout(std430, binding = 5) readonly buffer ParamsBuf {
+    uint nonce_start;
+    uint nonce_end;
+    uint epoch_count;
+    uint nonce_block_start;
+    uint padded_len;
+    uint nonce_size;
+    uint prefix_mode;
+    uint prefix[5];
+    uint mask[5];
+};
+
+layout(std430, binding = 6) buffer FoundBuf { uint found_flag; };
+
+#define RANGE_LOWER 97u
+#define RANGE_UPPER 122u
+
+// Rotate left
+uint rol(uint x, uint n) {
+    return (x << n) | (x >> (32u - n));
+}
+
+// SHA-1 block processing
+// Loads 64 bytes from local uint array (packed as bytes), processes one SHA-1 block
+void sha1_block(uint block_words[16], inout uint result[5]) {
+    uint a, b, c, d, e;
+    uint w[16];
+
+    // blk0: little-endian byte swap
+    for (int i = 0; i < 16; i++) {
+        uint v = block_words[i];
+        w[i] = (rol(v, 24u) & 0xFF00FF00u) | (rol(v, 8u) & 0x00FF00FFu);
+    }
+
+    a = result[0]; b = result[1]; c = result[2]; d = result[3]; e = result[4];
+
+    // R0: rounds 0-15 (use w directly after swap)
+    // F0(l,m,n,o,p,q) p += ((m&(n^o))^o) + w[q] + 0x5a827999 + rol(l,5); m = rol(m,30);
+    e += ((b & (c ^ d)) ^ d) + w[0]  + 0x5A827999u + rol(a, 5u); b = rol(b, 30u);
+    d += ((a & (b ^ c)) ^ c) + w[1]  + 0x5A827999u + rol(e, 5u); a = rol(a, 30u);
+    c += ((e & (a ^ b)) ^ b) + w[2]  + 0x5A827999u + rol(d, 5u); e = rol(e, 30u);
+    b += ((d & (e ^ a)) ^ a) + w[3]  + 0x5A827999u + rol(c, 5u); d = rol(d, 30u);
+    a += ((c & (d ^ e)) ^ e) + w[4]  + 0x5A827999u + rol(b, 5u); c = rol(c, 30u);
+    e += ((b & (c ^ d)) ^ d) + w[5]  + 0x5A827999u + rol(a, 5u); b = rol(b, 30u);
+    d += ((a & (b ^ c)) ^ c) + w[6]  + 0x5A827999u + rol(e, 5u); a = rol(a, 30u);
+    c += ((e & (a ^ b)) ^ b) + w[7]  + 0x5A827999u + rol(d, 5u); e = rol(e, 30u);
+    b += ((d & (e ^ a)) ^ a) + w[8]  + 0x5A827999u + rol(c, 5u); d = rol(d, 30u);
+    a += ((c & (d ^ e)) ^ e) + w[9]  + 0x5A827999u + rol(b, 5u); c = rol(c, 30u);
+    e += ((b & (c ^ d)) ^ d) + w[10] + 0x5A827999u + rol(a, 5u); b = rol(b, 30u);
+    d += ((a & (b ^ c)) ^ c) + w[11] + 0x5A827999u + rol(e, 5u); a = rol(a, 30u);
+    c += ((e & (a ^ b)) ^ b) + w[12] + 0x5A827999u + rol(d, 5u); e = rol(e, 30u);
+    b += ((d & (e ^ a)) ^ a) + w[13] + 0x5A827999u + rol(c, 5u); d = rol(d, 30u);
+    a += ((c & (d ^ e)) ^ e) + w[14] + 0x5A827999u + rol(b, 5u); c = rol(c, 30u);
+    e += ((b & (c ^ d)) ^ d) + w[15] + 0x5A827999u + rol(a, 5u); b = rol(b, 30u);
+
+    // BLK expansion macro inline
+    #define BLK(i) (w[(i) & 0xF] = rol(w[((i)+13) & 0xF] ^ w[((i)+8) & 0xF] ^ w[((i)+2) & 0xF] ^ w[(i) & 0xF], 1u))
+
+    // R1: rounds 16-19
+    d += ((a & (b ^ c)) ^ c) + BLK(16) + 0x5A827999u + rol(e, 5u); a = rol(a, 30u);
+    c += ((e & (a ^ b)) ^ b) + BLK(17) + 0x5A827999u + rol(d, 5u); e = rol(e, 30u);
+    b += ((d & (e ^ a)) ^ a) + BLK(18) + 0x5A827999u + rol(c, 5u); d = rol(d, 30u);
+    a += ((c & (d ^ e)) ^ e) + BLK(19) + 0x5A827999u + rol(b, 5u); c = rol(c, 30u);
+
+    // R2: rounds 20-39
+    e += (b ^ c ^ d) + BLK(20) + 0x6ED9EBA1u + rol(a, 5u); b = rol(b, 30u);
+    d += (a ^ b ^ c) + BLK(21) + 0x6ED9EBA1u + rol(e, 5u); a = rol(a, 30u);
+    c += (e ^ a ^ b) + BLK(22) + 0x6ED9EBA1u + rol(d, 5u); e = rol(e, 30u);
+    b += (d ^ e ^ a) + BLK(23) + 0x6ED9EBA1u + rol(c, 5u); d = rol(d, 30u);
+    a += (c ^ d ^ e) + BLK(24) + 0x6ED9EBA1u + rol(b, 5u); c = rol(c, 30u);
+    e += (b ^ c ^ d) + BLK(25) + 0x6ED9EBA1u + rol(a, 5u); b = rol(b, 30u);
+    d += (a ^ b ^ c) + BLK(26) + 0x6ED9EBA1u + rol(e, 5u); a = rol(a, 30u);
+    c += (e ^ a ^ b) + BLK(27) + 0x6ED9EBA1u + rol(d, 5u); e = rol(e, 30u);
+    b += (d ^ e ^ a) + BLK(28) + 0x6ED9EBA1u + rol(c, 5u); d = rol(d, 30u);
+    a += (c ^ d ^ e) + BLK(29) + 0x6ED9EBA1u + rol(b, 5u); c = rol(c, 30u);
+    e += (b ^ c ^ d) + BLK(30) + 0x6ED9EBA1u + rol(a, 5u); b = rol(b, 30u);
+    d += (a ^ b ^ c) + BLK(31) + 0x6ED9EBA1u + rol(e, 5u); a = rol(a, 30u);
+    c += (e ^ a ^ b) + BLK(32) + 0x6ED9EBA1u + rol(d, 5u); e = rol(e, 30u);
+    b += (d ^ e ^ a) + BLK(33) + 0x6ED9EBA1u + rol(c, 5u); d = rol(d, 30u);
+    a += (c ^ d ^ e) + BLK(34) + 0x6ED9EBA1u + rol(b, 5u); c = rol(c, 30u);
+    e += (b ^ c ^ d) + BLK(35) + 0x6ED9EBA1u + rol(a, 5u); b = rol(b, 30u);
+    d += (a ^ b ^ c) + BLK(36) + 0x6ED9EBA1u + rol(e, 5u); a = rol(a, 30u);
+    c += (e ^ a ^ b) + BLK(37) + 0x6ED9EBA1u + rol(d, 5u); e = rol(e, 30u);
+    b += (d ^ e ^ a) + BLK(38) + 0x6ED9EBA1u + rol(c, 5u); d = rol(d, 30u);
+    a += (c ^ d ^ e) + BLK(39) + 0x6ED9EBA1u + rol(b, 5u); c = rol(c, 30u);
+
+    // R3: rounds 40-59
+    e += (((b | c) & d) | (b & c)) + BLK(40) + 0x8F1BBCDCu + rol(a, 5u); b = rol(b, 30u);
+    d += (((a | b) & c) | (a & b)) + BLK(41) + 0x8F1BBCDCu + rol(e, 5u); a = rol(a, 30u);
+    c += (((e | a) & b) | (e & a)) + BLK(42) + 0x8F1BBCDCu + rol(d, 5u); e = rol(e, 30u);
+    b += (((d | e) & a) | (d & e)) + BLK(43) + 0x8F1BBCDCu + rol(c, 5u); d = rol(d, 30u);
+    a += (((c | d) & e) | (c & d)) + BLK(44) + 0x8F1BBCDCu + rol(b, 5u); c = rol(c, 30u);
+    e += (((b | c) & d) | (b & c)) + BLK(45) + 0x8F1BBCDCu + rol(a, 5u); b = rol(b, 30u);
+    d += (((a | b) & c) | (a & b)) + BLK(46) + 0x8F1BBCDCu + rol(e, 5u); a = rol(a, 30u);
+    c += (((e | a) & b) | (e & a)) + BLK(47) + 0x8F1BBCDCu + rol(d, 5u); e = rol(e, 30u);
+    b += (((d | e) & a) | (d & e)) + BLK(48) + 0x8F1BBCDCu + rol(c, 5u); d = rol(d, 30u);
+    a += (((c | d) & e) | (c & d)) + BLK(49) + 0x8F1BBCDCu + rol(b, 5u); c = rol(c, 30u);
+    e += (((b | c) & d) | (b & c)) + BLK(50) + 0x8F1BBCDCu + rol(a, 5u); b = rol(b, 30u);
+    d += (((a | b) & c) | (a & b)) + BLK(51) + 0x8F1BBCDCu + rol(e, 5u); a = rol(a, 30u);
+    c += (((e | a) & b) | (e & a)) + BLK(52) + 0x8F1BBCDCu + rol(d, 5u); e = rol(e, 30u);
+    b += (((d | e) & a) | (d & e)) + BLK(53) + 0x8F1BBCDCu + rol(c, 5u); d = rol(d, 30u);
+    a += (((c | d) & e) | (c & d)) + BLK(54) + 0x8F1BBCDCu + rol(b, 5u); c = rol(c, 30u);
+    e += (((b | c) & d) | (b & c)) + BLK(55) + 0x8F1BBCDCu + rol(a, 5u); b = rol(b, 30u);
+    d += (((a | b) & c) | (a & b)) + BLK(56) + 0x8F1BBCDCu + rol(e, 5u); a = rol(a, 30u);
+    c += (((e | a) & b) | (e & a)) + BLK(57) + 0x8F1BBCDCu + rol(d, 5u); e = rol(e, 30u);
+    b += (((d | e) & a) | (d & e)) + BLK(58) + 0x8F1BBCDCu + rol(c, 5u); d = rol(d, 30u);
+    a += (((c | d) & e) | (c & d)) + BLK(59) + 0x8F1BBCDCu + rol(b, 5u); c = rol(c, 30u);
+
+    // R4: rounds 60-79
+    e += (b ^ c ^ d) + BLK(60) + 0xCA62C1D6u + rol(a, 5u); b = rol(b, 30u);
+    d += (a ^ b ^ c) + BLK(61) + 0xCA62C1D6u + rol(e, 5u); a = rol(a, 30u);
+    c += (e ^ a ^ b) + BLK(62) + 0xCA62C1D6u + rol(d, 5u); e = rol(e, 30u);
+    b += (d ^ e ^ a) + BLK(63) + 0xCA62C1D6u + rol(c, 5u); d = rol(d, 30u);
+    a += (c ^ d ^ e) + BLK(64) + 0xCA62C1D6u + rol(b, 5u); c = rol(c, 30u);
+    e += (b ^ c ^ d) + BLK(65) + 0xCA62C1D6u + rol(a, 5u); b = rol(b, 30u);
+    d += (a ^ b ^ c) + BLK(66) + 0xCA62C1D6u + rol(e, 5u); a = rol(a, 30u);
+    c += (e ^ a ^ b) + BLK(67) + 0xCA62C1D6u + rol(d, 5u); e = rol(e, 30u);
+    b += (d ^ e ^ a) + BLK(68) + 0xCA62C1D6u + rol(c, 5u); d = rol(d, 30u);
+    a += (c ^ d ^ e) + BLK(69) + 0xCA62C1D6u + rol(b, 5u); c = rol(c, 30u);
+    e += (b ^ c ^ d) + BLK(70) + 0xCA62C1D6u + rol(a, 5u); b = rol(b, 30u);
+    d += (a ^ b ^ c) + BLK(71) + 0xCA62C1D6u + rol(e, 5u); a = rol(a, 30u);
+    c += (e ^ a ^ b) + BLK(72) + 0xCA62C1D6u + rol(d, 5u); e = rol(e, 30u);
+    b += (d ^ e ^ a) + BLK(73) + 0xCA62C1D6u + rol(c, 5u); d = rol(d, 30u);
+    a += (c ^ d ^ e) + BLK(74) + 0xCA62C1D6u + rol(b, 5u); c = rol(c, 30u);
+    e += (b ^ c ^ d) + BLK(75) + 0xCA62C1D6u + rol(a, 5u); b = rol(b, 30u);
+    d += (a ^ b ^ c) + BLK(76) + 0xCA62C1D6u + rol(e, 5u); a = rol(a, 30u);
+    c += (e ^ a ^ b) + BLK(77) + 0xCA62C1D6u + rol(d, 5u); e = rol(e, 30u);
+    b += (d ^ e ^ a) + BLK(78) + 0xCA62C1D6u + rol(c, 5u); d = rol(d, 30u);
+    a += (c ^ d ^ e) + BLK(79) + 0xCA62C1D6u + rol(b, 5u); c = rol(c, 30u);
+
+    #undef BLK
+
+    result[0] += a; result[1] += b; result[2] += c; result[3] += d; result[4] += e;
+}
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+
+    uint ns = nonce_size;
+    uint nonce_off = nonce_start - nonce_block_start;
+
+    // Number of uints needed to store nonce_size bytes
+    uint nonce_uints = (ns + 3u) / 4u;
+
+    // Load per-thread nonce from packed uint buffer
+    uint my_nonce[8]; // max 32 bytes = 8 uints
+    for (uint i = 0; i < nonce_uints; i++)
+        my_nonce[i] = nonces[tid * nonce_uints + i];
+
+    // Load nonce block template (64 bytes = 16 uints)
+    uint nonce_block[16];
+    uint blk_base = nonce_block_start / 4u;
+    for (uint i = 0; i < 16u; i++)
+        nonce_block[i] = data_padded[blk_base + i];
+
+    // Overlay nonce bytes into nonce_block
+    for (uint i = 0; i < ns; i++) {
+        uint byte_val = (my_nonce[i / 4u] >> ((i % 4u) * 8u)) & 0xFFu;
+        uint dst = nonce_off + i;
+        uint wi = dst / 4u;
+        uint bo = (dst % 4u) * 8u;
+        nonce_block[wi] = (nonce_block[wi] & ~(0xFFu << bo)) | (byte_val << bo);
+    }
+
+    // Load local best results
+    uint local_best[5];
+    for (uint i = 0; i < 5u; i++)
+        local_best[i] = best_results[tid * 5u + i];
+
+    // Load local best nonce
+    uint local_best_nonce[8];
+    for (uint i = 0; i < nonce_uints; i++)
+        local_best_nonce[i] = my_nonce[i];
+
+    // Temp block for remaining blocks
+    uint temp_block[16];
+
+    for (uint ep = 0; ep < epoch_count; ep++) {
+        if (prefix_mode != 0u && found_flag != 0u)
+            break;
+
+        for (uint j = RANGE_LOWER; j <= RANGE_UPPER; j++) {
+            // Set first nonce byte in nonce_block
+            {
+                uint dst = nonce_off;
+                uint wi = dst / 4u;
+                uint bo = (dst % 4u) * 8u;
+                nonce_block[wi] = (nonce_block[wi] & ~(0xFFu << bo)) | (j << bo);
+            }
+
+            // Restore cached state
+            uint result[5];
+            for (uint k = 0; k < 5u; k++)
+                result[k] = state_cache[k];
+
+            // Process nonce block
+            sha1_block(nonce_block, result);
+
+            // Process remaining blocks from device memory
+            for (uint blk = nonce_block_start + 64u; blk < padded_len; blk += 64u) {
+                uint base = blk / 4u;
+                for (uint i = 0; i < 16u; i++)
+                    temp_block[i] = data_padded[base + i];
+                sha1_block(temp_block, result);
+            }
+
+            if (prefix_mode != 0u) {
+                // Prefix match mode
+                bool match = true;
+                for (uint k = 0; k < 5u; k++) {
+                    if ((result[k] & mask[k]) != prefix[k]) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match) {
+                    // Store result
+                    for (uint k = 0; k < 5u; k++)
+                        best_results[tid * 5u + k] = result[k];
+
+                    // Build the matching nonce: first byte = j, rest from my_nonce
+                    {
+                        uint bo0 = (0u % 4u) * 8u;
+                        my_nonce[0] = (my_nonce[0] & ~(0xFFu << bo0)) | (j << bo0);
+                    }
+                    for (uint i = 0; i < nonce_uints; i++)
+                        best_nonces[tid * nonce_uints + i] = my_nonce[i];
+
+                    atomicExchange(found_flag, 1u);
+                    return;
+                }
+            } else {
+                // Lowest hash mode
+                bool lower = false;
+                for (uint k = 0; k < 5u; k++) {
+                    if (result[k] < local_best[k]) { lower = true; break; }
+                    if (result[k] > local_best[k]) { break; }
+                }
+                if (lower) {
+                    for (uint k = 0; k < 5u; k++)
+                        local_best[k] = result[k];
+                    // Update local best nonce: byte 0 = j, rest from my_nonce
+                    local_best_nonce[0] = (local_best_nonce[0] & ~0xFFu) | j;
+                    for (uint i = 1; i < nonce_uints; i++)
+                        local_best_nonce[i] = my_nonce[i];
+                }
+            }
+        }
+
+        // Advance nonce (positions 1+)
+        {
+            // Increment byte at position 1
+            uint byte1 = (my_nonce[1u / 4u] >> ((1u % 4u) * 8u)) & 0xFFu;
+            byte1++;
+            {
+                uint wi = 1u / 4u;
+                uint bo = (1u % 4u) * 8u;
+                my_nonce[wi] = (my_nonce[wi] & ~(0xFFu << bo)) | ((byte1 & 0xFFu) << bo);
+            }
+
+            uint rs = 1u;
+            uint cur_byte = byte1;
+            while (cur_byte > RANGE_UPPER) {
+                // Set current position to RANGE_LOWER
+                {
+                    uint wi = rs / 4u;
+                    uint bo = (rs % 4u) * 8u;
+                    my_nonce[wi] = (my_nonce[wi] & ~(0xFFu << bo)) | (RANGE_LOWER << bo);
+                }
+                rs++;
+                if (rs >= ns) break;
+                // Increment next position
+                cur_byte = (my_nonce[rs / 4u] >> ((rs % 4u) * 8u)) & 0xFFu;
+                cur_byte++;
+                {
+                    uint wi = rs / 4u;
+                    uint bo = (rs % 4u) * 8u;
+                    my_nonce[wi] = (my_nonce[wi] & ~(0xFFu << bo)) | ((cur_byte & 0xFFu) << bo);
+                }
+            }
+
+            // Update nonce_block with new nonce bytes (positions 1+)
+            for (uint i = 1u; i < ns; i++) {
+                uint byte_val = (my_nonce[i / 4u] >> ((i % 4u) * 8u)) & 0xFFu;
+                uint dst = nonce_off + i;
+                uint wi = dst / 4u;
+                uint bo = (dst % 4u) * 8u;
+                nonce_block[wi] = (nonce_block[wi] & ~(0xFFu << bo)) | (byte_val << bo);
+            }
+        }
+    }
+
+    // Write back results
+    for (uint i = 0; i < 5u; i++)
+        best_results[tid * 5u + i] = local_best[i];
+
+    // Write back nonces
+    for (uint i = 0; i < nonce_uints; i++) {
+        nonces[tid * nonce_uints + i] = my_nonce[i];
+        best_nonces[tid * nonce_uints + i] = local_best_nonce[i];
+    }
+}
