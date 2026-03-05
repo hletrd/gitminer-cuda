@@ -47,14 +47,16 @@ Measured with a 244-byte test commit object (1 remaining SHA-1 block after pre-c
 
 | Platform | Backend | Hash Rate |
 |---|---|---|
+| NVIDIA RTX 5090 | CUDA | 46.9 GH/s |
 | NVIDIA RTX 4090 | CUDA | 27.5 GH/s |
 | Apple M4 Pro | Metal | 2.3 GH/s |
 | AMD EPYC 7352 (48 threads) | CPU | ~500 MH/s |
+| AMD Ryzen 7 9700X (16 threads) | CPU | ~174 MH/s |
 | Apple M4 Pro (12 threads) | CPU | ~159 MH/s |
 
 Notes:
 
-- RTX 4090 found 9 leading zeros in under 5 seconds, processed 613B hashes in 30s
+- RTX 5090 processed 817B SHA-1 hashes in 30s (1.7x faster than RTX 4090)
 - Hash rate scales inversely with commit object size (more SHA-1 blocks per hash)
 - CUDA kernel: 1024 blocks x 256 threads = 262,144 threads
 - Metal kernel: 65,536 GPU threads (256 per threadgroup)
