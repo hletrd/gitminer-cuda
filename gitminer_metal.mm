@@ -344,7 +344,10 @@ int main(int argc, char *argv[]) {
 	int NUM_THREADS = 65536;
 	int EPOCH_COUNT = 100;
 
-	// argv[1] is ignored (CPU thread count for compatibility); Metal always uses NUM_THREADS GPU threads
+	// argv[1] is ignored (device ID for compatibility with other backends)
+	// Use GPU_THREADS env var to override GPU thread count
+	const char *env_threads = getenv("GPU_THREADS");
+	if (env_threads && atoi(env_threads) > 0) { NUM_THREADS = atoi(env_threads); }
 	if (argc > 2) { filename_log = argv[2]; logmode = 0; } else { filename_log = "log.txt"; }
 	if (argc > 3) { filename_out = argv[3]; } else { filename_out = "result.txt"; }
 	if (argc > 4) { g_nonce_start = atoi(argv[4]); }
