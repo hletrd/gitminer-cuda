@@ -88,11 +88,46 @@ Notes:
 - Metal kernel: 65,536 GPU threads (256 per threadgroup)
 - Data center GPUs (H100, A100) have lower INT32 throughput than consumer GPUs due to lower clock speeds (H100: 1980 MHz, A100: 1410 MHz vs RTX 4090: 2520 MHz), despite having more SMs
 
-## Setup as Post-Commit Hook
+## mine_commit.sh
 
 `mine_commit.sh` automatically mines each commit after it is created. It works with both GPG-signed and unsigned commits.
 
-### Quick Setup
+### Modes
+
+```sh
+# Leading zeros mode (default): mine for N leading hex zeros
+mine_commit.sh [target_zeros] [threads]
+mine_commit.sh 7 12         # 7 leading zeros, 12 threads
+
+# Infinite mode: run forever finding the lowest possible hash
+# Press Ctrl+C to stop and apply the best result found so far
+mine_commit.sh infinite [threads]
+mine_commit.sh infinite 12
+
+# Incremental mode: auto-generate sequential hex prefix per commit
+# First commit -> 0000000, second -> 0000001, ..., 11th -> 000000a, etc.
+mine_commit.sh incremental [prefix_length] [threads]
+mine_commit.sh incremental 7 12   # 7-digit prefix, 12 threads
+```
+
+| Mode | Description | Terminates? |
+|---|---|---|
+| `[target_zeros]` | Mine for N leading hex zeros (default: 7) | Yes, when target reached |
+| `infinite` | Find the lowest possible hash | No, runs until Ctrl+C |
+| `incremental` | Sequential hex prefix based on commit number | Yes, when prefix matched |
+
+### Miner Auto-Detection
+
+The script auto-detects the best available backend in priority order:
+
+CUDA > Vulkan > Metal > OpenCL > CPU
+
+### How It Works
+
+- **Unsigned commits**: appends `nonce:<random>` to the commit message, then mines
+- **GPG-signed commits**: injects a `Comment: nonce=<random>` line into the PGP armor block. This field is ignored by GPG signature verification but is part of the git object hash, so the signature remains valid after mining
+
+### Setup as Post-Commit Hook
 
 ```sh
 # 1. Build the miner (pick your backend)
@@ -103,23 +138,6 @@ make gitminer_cpu     # any platform
 # 2. Install as post-commit hook in your repo
 cp mine_commit.sh /path/to/your/repo/.git/hooks/post-commit
 chmod +x /path/to/your/repo/.git/hooks/post-commit
-```
-
-### How the Hook Works
-
-- **Unsigned commits**: appends `nonce:<random>` to the commit message, then mines for leading zeros
-- **GPG-signed commits**: injects a `Comment: nonce=<random>` line into the PGP armor block. This field is ignored by GPG signature verification but is part of the git object hash, so the signature remains valid after mining
-
-The hook auto-detects the best available backend: Metal GPU > OpenCL GPU > CPU.
-
-### Configuration
-
-Edit the hook script or pass arguments:
-
-```sh
-# In .git/hooks/post-commit:
-TARGET_ZEROS=7      # number of leading hex zeros (default: 7)
-THREADS=12          # CPU threads (default: auto-detect)
 ```
 
 ### Global Setup (All Repos)
